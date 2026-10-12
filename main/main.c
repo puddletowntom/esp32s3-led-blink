@@ -6,13 +6,25 @@
 /* Onboard WS2812 addressable RGB LED of ESP32-S3-DevKitC-1: GPIO48 */
 #define LED_PIN      GPIO_NUM_48
 #define LED_COUNT    1
-#define INTERVAL_MS  500
+#define BLINK_ON_MS  500    /* LED lit in chosen color per blink */
+#define BLINK_GAP_MS 200    /* brief dark gap between the two blinks */
+#define PAUSE_MS     1000   /* LED dark pause when changing color */
 
 static led_strip_handle_t led;
 
 static void set_color(uint8_t r, uint8_t g, uint8_t b) {
     led_strip_set_pixel(led, 0, r, g, b);
     led_strip_refresh(led);
+}
+
+static void blink_twice(uint8_t r, uint8_t g, uint8_t b, const char *name) {
+    for (int i = 0; i < 2; i++) {
+        set_color(r, g, b);
+        printf("%s\n", name);
+        vTaskDelay(pdMS_TO_TICKS(BLINK_ON_MS));
+        led_strip_clear(led);
+        vTaskDelay(pdMS_TO_TICKS(BLINK_GAP_MS));
+    }
 }
 
 void app_main(void) {
@@ -30,13 +42,12 @@ void app_main(void) {
     bool blue = true;
     while (1) {
         if (blue) {
-            set_color(0, 0, 255);
-            printf("BLUE\n");
+            blink_twice(0, 0, 255, "BLUE");
         } else {
-            set_color(255, 0, 0);
-            printf("RED\n");
+            blink_twice(255, 0, 0, "RED");
         }
         blue = !blue;
-        vTaskDelay(pdMS_TO_TICKS(INTERVAL_MS));
+        printf("PAUSE\n");
+        vTaskDelay(pdMS_TO_TICKS(PAUSE_MS));
     }
 }
