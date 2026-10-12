@@ -1,0 +1,7 @@
+menu "OTA test app"
+
+    config OTA_V2_BLUE
+        bool "v2 build: blue disconnect indicator (flash blue instead of red)"
+        default n
+
+endmenu

@@ -1,5 +1,5 @@
-build/
+build*/
 managed_components/
 dependencies.lock
-sdkconfig
+sdkconfig*
 main/wifi_secrets.h

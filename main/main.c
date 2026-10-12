@@ -9,6 +9,8 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_https_ota.h"
 #include "led_strip.h"
 #include "wifi_secrets.h"
 
@@ -28,6 +30,21 @@
 
 #define RED   255, 0, 0
 #define GREEN 0, 255, 0
+#define BLUE  0, 0, 255
+
+/* Disconnect-indicator color: red in the v1 build, blue in the v2 build
+ * (CONFIG_OTA_V2_BLUE set via sdkconfig.v2.defaults). */
+#ifdef CONFIG_OTA_V2_BLUE
+#define DISC_COLOR  BLUE
+#define DISC_NAME   "DISCONNECTED_BLUE"
+#else
+#define DISC_COLOR  RED
+#define DISC_NAME   "DISCONNECTED_RED"
+#endif
+
+/* Where the app checks for OTA updates (HTTP only for LAN testing;
+ * CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y must stay a conscious choice). */
+#define OTA_URL "http://192.168.0.201:8000/firmware_v2.bin"
 
 static const char *TAG = "app";
 
@@ -51,6 +68,84 @@ static void blink_twice(uint8_t r, uint8_t g, uint8_t b, const char *name) {
 static EventGroupHandle_t wifi_events;
 #define WIFI_CONNECTED_BIT BIT0
 
+/* --- OTA --------------------------------------------------------------- */
+
+/* Compare dotted semver strings: returns >0 if b is newer than a. */
+static int semver_newer(const char *a, const char *b) {
+    int va[3] = {0}, vb[3] = {0};
+    if (sscanf(a, "%d.%d.%d", &va[0], &va[1], &va[2]) != 3) return -1;
+    if (sscanf(b, "%d.%d.%d", &vb[0], &vb[1], &vb[2]) != 3) return -1;
+    for (int i = 0; i < 3; i++) {
+        if (vb[i] != va[i]) return vb[i] - va[i];
+    }
+    return 0;
+}
+
+static void ota_task(void *arg) {
+    const esp_app_desc_t *cur = esp_app_get_description();
+    ESP_LOGI(TAG, "OTA check: running v%s, fetching %s", cur->version, OTA_URL);
+
+    esp_http_client_config_t http_cfg = {
+        .url = OTA_URL,
+        .timeout_ms = 10000,
+        .keep_alive_enable = true,
+    };
+    esp_https_ota_config_t ota_cfg = { .http_config = &http_cfg };
+
+    esp_https_ota_handle_t handle = NULL;
+    esp_err_t err = esp_https_ota_begin(&ota_cfg, -1, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const esp_app_desc_t *new_desc = esp_https_ota_get_img_desc(handle);
+    if (new_desc == NULL) {
+        ESP_LOGE(TAG, "OTA: could not read image descriptor, aborting");
+        esp_https_ota_abort(handle);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "OTA: server offers v%s", new_desc->version);
+
+    if (semver_newer(cur->version, new_desc->version) <= 0) {
+        ESP_LOGI(TAG, "OTA: running v%s is up to date (offered v%s), skipping",
+                 cur->version, new_desc->version);
+        esp_https_ota_abort(handle);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while ((err = esp_https_ota_perform(handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) { }
+    if (err != ESP_OK || !esp_https_ota_is_complete_data_received(handle)) {
+        ESP_LOGE(TAG, "OTA download failed: %s", esp_err_to_name(err));
+        esp_https_ota_abort(handle);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_err_t set_err = esp_ota_set_boot_partition(
+        esp_ota_get_next_update_partition(NULL));
+    if (set_err != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: could not set boot partition: %s",
+                 esp_err_to_name(set_err));
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "OTA to v%s complete, rebooting...", new_desc->version);
+    esp_restart();
+}
+
+static void maybe_start_ota(void) {
+    static bool ota_started = false;
+    if (ota_started) return;
+    ota_started = true;
+    xTaskCreate(ota_task, "ota", 8192, NULL, 5, NULL);
+}
+
+/* ----------------------------------------------------------------------- */
+
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data) {
     if (base == WIFI_EVENT) {
@@ -71,6 +166,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "GOT_IP " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT);
+        /* With rollback enabled, a freshly-OTA'd image boots in
+         * PENDING_VERIFY; connecting to WiFi is our self-test. */
+        esp_ota_img_states_t st;
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        if (esp_ota_get_state_partition(running, &st) == ESP_OK &&
+            st == ESP_OTA_IMG_PENDING_VERIFY) {
+            ESP_LOGI(TAG, "new image verified, marking valid");
+            esp_ota_mark_app_valid_cancel_rollback();
+        }
     }
 }
 
@@ -128,14 +232,15 @@ void app_main(void) {
 
     while (1) {
         EventBits_t bits = xEventGroupWaitBits(wifi_events, WIFI_CONNECTED_BIT,
-                                               pdFALSE, pdFALSE,
+                                               pdFALSE, pdTRUE,
                                                pdMS_TO_TICKS(PAUSE_MS));
         if (bits & WIFI_CONNECTED_BIT) {
             set_color(GREEN);
             printf("CONNECTED\n");
             vTaskDelay(pdMS_TO_TICKS(BLINK_ON_MS));
+            maybe_start_ota();  /* one OTA check per boot, right after first connect */
         } else {
-            blink_twice(RED, "DISCONNECTED");
+            blink_twice(DISC_COLOR, DISC_NAME);
             printf("PAUSE\n");
         }
     }
